@@ -1,0 +1,55 @@
+﻿#include "../Shaders/DepthOfFieldCommon.hlsl"
+
+#pragma kernel DOFCoCReProj
+
+#pragma multi_compile _ MAX_BLENDING
+
+#define MotionBlending              _Params1.x
+
+//input texture
+TEXTURE2D(_InputCoCTexture);
+TEXTURE2D(_InputHistoryCoCTexture);
+//output reprojected texture(coc)
+RWTexture2D<float> _OutputCoCTexture;
+
+[numthreads(8, 8, 1)]
+void DOFCoCReProj(uint3 dispatchThreadId : SV_DispatchThreadId) {
+	float2 uv = dispatchThreadId.xy / (_CameraBufferSize.zw - 1);
+	float2 texelSize = _CameraBufferSize.xy;
+	//TODO: Maybe replace some SAMPLE to LOAD https://gamedev.stackexchange.com/questions/65845/difference-between-texture-load-and-texture-sample-methods-in-directx/65853
+	float coc1 = SAMPLE_TEXTURE2D_LOD(_InputCoCTexture, sampler_linear_clamp, uv - float2(1.0, 0.0) * texelSize, 0).x;
+	float coc2 = SAMPLE_TEXTURE2D_LOD(_InputCoCTexture, sampler_linear_clamp, uv - float2(0.0, 1.0) * texelSize, 0).x;
+	float coc3 = SAMPLE_TEXTURE2D_LOD(_InputCoCTexture, sampler_linear_clamp, uv + float2(0.0, 1.0) * texelSize, 0).x;
+	float coc4 = SAMPLE_TEXTURE2D_LOD(_InputCoCTexture, sampler_linear_clamp, uv + float2(1.0, 0.0) * texelSize, 0).x;
+#if defined(MAX_BLENDING)
+	float coc0 = SAMPLE_TEXTURE2D_LOD(_InputCoCTexture, sampler_point_clamp, uv - _Jitter, 0).x;
+#else
+	float coc0 = SAMPLE_TEXTURE2D_LOD(_InputCoCTexture, sampler_linear_clamp, uv - _Jitter, 0).x;
+#endif
+	//coc dilate : determin the cloest point in the for neighbor(coord + coc)
+	float3 closest = float3(0.0, 0.0, coc0);
+	closest = coc1 < closest.z ? float3(-1.0, 0.0, coc1) : closest;
+	closest = coc2 < closest.z ? float3(0.0, -1.0, coc2) : closest;
+	closest = coc3 < closest.z ? float3(0.0, 1.0, coc3) : closest;
+	closest = coc4 < closest.z ? float3(1.0, 0.0, coc4) : closest;
+	//sample history buffer with the movtion vector at the closest point
+	float2 motionVectorUV = uv + closest.xy * texelSize;
+	//NOTE HERE : maybe last frame motion vector
+	float2 motionVector = SAMPLE_TEXTURE2D_LOD(_CameraMotionVectorTexture, sampler_point_clamp, motionVectorUV, 0).rg;
+#if defined(MAX_BLENDING)
+	float cocHistory = SAMPLE_TEXTURE2D_LOD(_InputHistoryCoCTexture, sampler_point_clamp, uv - motionVector, 0).x;
+#else
+	float cocHistory = SAMPLE_TEXTURE2D_LOD(_InputHistoryCoCTexture, sampler_linear_clamp, uv - motionVector, 0).x;
+#endif
+	//neighborhood clamping
+#if defined(MAX_BLENDING)
+	float cocMin = closest.z;
+#else
+	float cocMin = min(closest.z, 1.0f);
+#endif
+	float cocMax = Max3(Max3(coc0, coc1, coc2), coc3, coc4);
+	cocHistory = clamp(cocHistory, cocMin, cocMax);
+	float outputCoC = lerp(coc0, cocHistory, MotionBlending);
+
+	_OutputCoCTexture[dispatchThreadId.xy] = outputCoC;
+}

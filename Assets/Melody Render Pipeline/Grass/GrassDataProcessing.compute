@@ -1,0 +1,178 @@
+#pragma kernel Processing
+
+struct GrassData {
+	float3 position;
+	int chunkID;
+	float2 worldCoord;
+	float3 boundsMin;
+	float3 boundsMax;
+};
+
+float4x4 _VPMatrix;
+float _MaxDrawDistance;
+float _LodDistance;
+float _MinX, _MinZ;
+float _MaxX, _MaxZ;
+float4 _FrustumPlanes[6];
+uint _MemoryOffset;
+
+bool FrustumCulling;
+bool OcclusionCulling;
+
+Texture2D _HierarchicalDepthTexture;
+float4 _CameraBufferSize;
+float3 _WorldSpaceCameraPos;
+
+RWStructuredBuffer<GrassData> _GrassData;
+AppendStructuredBuffer<uint> _IdOfVisibleGrass;
+AppendStructuredBuffer<uint> _IdOfLodGrass;
+
+bool IsPointOutsideThePlane(float4 plane, float3 position) {
+	return dot(plane.xyz, position) + plane.w > 0;
+}
+
+bool IsBoundsOutsideThePlane(float4 plane, float3 boundsMin, float3 boundsMax) {
+	float3 center = (boundsMin + boundsMax) / 2;
+	float radius = max(max((boundsMax.x - boundsMin.x), (boundsMax.y - boundsMin.y)), (boundsMax.z - boundsMin.z)) / 2;
+	return dot(plane.xyz, center) + plane.w > radius;
+}
+
+[numthreads(64,1,1)]
+void Processing(uint3 id : SV_DispatchThreadID) {
+	uint validID = id.x + _MemoryOffset;
+	GrassData data = _GrassData[validID];
+	float3 posWS = data.position;
+//------------------------------------------------------------fast frustum culling-----------------------------------------------------------//
+	//float4 absPosCS = abs(mul(_VPMatrix, float4(posWS, 1.0)));
+	////do culling test in clip space, result is the same as doing test in NDC space.
+	////prefer clip space here because doing culling test in clip space is faster than doing culling test in NDC, because we can skip 1 division.
+	////the test is using OpenGL standard projection matrix, because all matrix from unity C# is OpenGL standard
+	////if instance is inside camera frustum, and is within draw distance, we append it to _VisibleInstanceOnlyTransformBuffer
+	////y test allow 50% more threshold (hardcode for grass)
+	////x test allow 10% more threshold (hardcode for grass)
+	//if (absPosCS.z <= absPosCS.w && absPosCS.y <= absPosCS.w * 1.5 && absPosCS.x <= absPosCS.w * 1.1 && absPosCS.w <= _MaxDrawDistance) {
+	//	if (absPosCS.w <= _LodDistance) {
+	//		_IdOfVisibleGrass.Append(validID);
+	//	}
+	//	else {
+	//		_IdOfLodGrass.Append(validID);
+	//	}
+	//	//go deep into processing data only for valid visible grass
+	//	float coordX = clamp((data.position.x - _MinX) / (_MaxX - _MinX), 0.0, 1.0);
+	//	float coordZ = clamp((data.position.z - _MinZ) / (_MaxZ - _MinZ), 0.0, 1.0);
+	//	float2 worldCoord = float2(coordX, coordZ);
+	//	_GrassData[validID].worldCoord = worldCoord;
+	//}
+//--------------------------------------------------------------------------------------------------------------------------------------------//
+
+////------------------------------------------accurate culling: frustum + occlusion(Hiz)------------------------------------------------------//
+	float3 boundsVerts[8];
+	float3 boundsMin = data.boundsMin;
+	float3 boundsMax = data.boundsMax;
+	boundsVerts[0] = boundsMin;
+	boundsVerts[1] = boundsMax;
+	boundsVerts[2] = float3(boundsMax.x, boundsMax.y, boundsMin.z);
+	boundsVerts[3] = float3(boundsMax.x, boundsMin.y, boundsMax.z);
+	boundsVerts[6] = float3(boundsMax.x, boundsMin.y, boundsMin.z);
+	boundsVerts[4] = float3(boundsMin.x, boundsMax.y, boundsMax.z);
+	boundsVerts[5] = float3(boundsMin.x, boundsMax.y, boundsMin.z);
+	boundsVerts[7] = float3(boundsMin.x, boundsMin.y, boundsMax.z);
+
+	if (FrustumCulling) {
+		for (int i = 0; i < 6; i++) {
+			//a faster method of check the distance from plane to bounds center and bounds radius straightforward
+			if (IsBoundsOutsideThePlane(_FrustumPlanes[i], boundsMin, boundsMax)) {
+				return;
+			}
+			//for (int j = 0; j < 8; j++) {
+			//	float3 boundsPosition = boundsVerts[j];
+			//	if (!IsPointOutsideThePlane(_FrustumPlanes[i], boundsPosition))
+			//		break;
+			//	if (j == 7)
+			//		return;
+			//}
+		}
+	}
+
+	if (OcclusionCulling) {
+		float minX = 1, minY = 1, minZ = 1;
+		float maxX = -1, maxY = -1, maxZ = -1;
+		//calculate the bounds with ndc
+		for (int i = 0; i < 8; i++) {
+			float4 clipPos = mul(_VPMatrix, float4(boundsVerts[i], 1.0));
+			float3 ndc = clipPos.xyz / clipPos.w;
+			if (minX > ndc.x) minX = ndc.x;
+			if (minY > ndc.y) minY = ndc.y;
+			if (minZ > ndc.z) minZ = ndc.z;
+			if (maxX < ndc.x) maxX = ndc.x;
+			if (maxY < ndc.y) maxY = ndc.y;
+			if (maxZ < ndc.z) maxZ = ndc.z;
+		}
+		float2 uvLeftBottom = float2(minX, minY) * 0.5f + 0.5f;
+		float2 uvRightTop = float2(maxX, maxY) * 0.5f + 0.5f;
+#if UNITY_REVERSED_Z
+		depth = minZ;
+		depth = depth * 0.5f + 0.5f;
+#else
+		float depth = maxZ;
+#endif
+		//bounds size in screen space is half the ndc
+		uint2 screenSize = _CameraBufferSize.zw;
+		uint2 boundsSize = uint2(maxX - minX, maxY - minY) * 0.5 * screenSize;
+		uint mip = (uint)clamp(log2(max(boundsSize.x, boundsSize.y)), 0, log2(max(screenSize.x, screenSize.y)) - 4);
+		uint2 curMipSize = screenSize / (1 << mip);
+		uint2 pixelLeftBottom = uint2(clamp(uvLeftBottom.x * curMipSize.x, 0, curMipSize.x - 1), clamp(uvLeftBottom.y * curMipSize.y, 0, curMipSize.y - 1));
+		uint2 pixelRightTop = uint2(clamp(uvRightTop.x * curMipSize.x, 0, curMipSize.x - 1), clamp(uvRightTop.y * curMipSize.y, 0, curMipSize.y - 1));
+		float hizDepth = _HierarchicalDepthTexture.mips[mip][pixelLeftBottom].r;
+#if UNITY_REVERSED_Z
+		//bounds occupied both horizon and vertical
+		if (pixelLeftBottom.x < pixelRightTop.x && pixelLeftBottom.y < pixelRightTop.y) {
+			hizDepth = max(max(hizDepth, _HierarchicalDepthTexture.mips[mip][pixelRightTop].r),
+				max(_HierarchicalDepthTexture.mips[mip][int2(pixelLeftBottom.x, pixelRightTop.y)].r,
+					_HierarchicalDepthTexture.mips[mip][int2(pixelRightTop.x, pixelLeftBottom.y)].r));
+		}
+		//bounds occupied horizon
+		else if (pixelLeftBottom.x < pixelRightTop.x) {
+			hizDepth = max(hizDepth, _HierarchicalDepthTexture.mips[mip][int2(pixelRightTop.x, pixelLeftBottom.y)].r);
+		}
+		//bounds occupied vertical
+		else if (pixelLeftBottom.y < pixelRightTop.y) {
+			hizDepth = max(hizDepth, _HierarchicalDepthTexture.mips[mip][int2(pixelLeftBottom.x, pixelRightTop.y)].r);
+		}
+		if (hizDepth < depth)
+			return;
+#else
+		//bounds occupied both horizon and vertical
+		if (pixelLeftBottom.x < pixelRightTop.x && pixelLeftBottom.y < pixelRightTop.y) {
+			hizDepth = min(min(hizDepth, _HierarchicalDepthTexture.mips[mip][pixelRightTop].r),
+				min(_HierarchicalDepthTexture.mips[mip][int2(pixelLeftBottom.x, pixelRightTop.y)].r,
+					_HierarchicalDepthTexture.mips[mip][int2(pixelRightTop.x, pixelLeftBottom.y)].r));
+		}
+		//bounds occupied horizon
+		else if (pixelLeftBottom.x < pixelRightTop.x) {
+			hizDepth = min(hizDepth, _HierarchicalDepthTexture.mips[mip][int2(pixelRightTop.x, pixelLeftBottom.y)].r);
+		}
+		//bounds occupied vertical
+		else if (pixelLeftBottom.y < pixelRightTop.y) {
+			hizDepth = min(hizDepth, _HierarchicalDepthTexture.mips[mip][int2(pixelLeftBottom.x, pixelRightTop.y)].r);
+		}
+		if (hizDepth > depth)
+			return;
+#endif
+	}
+
+	float dstToCamera = length(_WorldSpaceCameraPos - posWS);
+	if (dstToCamera <= _LodDistance) {
+		_IdOfVisibleGrass.Append(validID);
+	}
+	else {
+		_IdOfLodGrass.Append(validID);
+	}
+
+	//go deep into processing data only for valid visible grass
+	float coordX = clamp((data.position.x - _MinX) / (_MaxX - _MinX), 0.0, 1.0);
+	float coordZ = clamp((data.position.z - _MinZ) / (_MaxZ - _MinZ), 0.0, 1.0);
+	float2 worldCoord = float2(coordX, coordZ);
+	_GrassData[validID].worldCoord = worldCoord;
+//--------------------------------------------------------------------------------------------------------------------------------------------//
+}
